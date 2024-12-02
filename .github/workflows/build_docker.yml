@@ -1,37 +1,79 @@
-name: Build and Push Docker Image to ECR
-
+name: Build and push Docker image
 on:
   workflow_dispatch:
 
+  repository_dispatch:
+    types: [release-published]
+
+env:
+  RELEASE_VERSION: v${{ github.event.client_payload.version }}
+  TAG_VERSION: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backstage:${{ github.event.client_payload.version }}
+
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20.x]
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - name: Harden Runner
+        uses: step-security/harden-runner@91182cccc01eb5e619899d80e4e971d6181294a7 # v2.10.1
+        with:
+          egress-policy: audit
+
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: backstage
+          ref: ${{ github.event.client_payload.version && env.RELEASE_VERSION || github.ref }}
+
+      - name: use node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          registry-url: https://registry.npmjs.org/ # Needed for auth
+
+      - name: yarn install
+        uses: backstage/actions/yarn-install@25145dd4117d50e1da9330e9ed2893bc6b75373e # v0.6.15
+        with:
+          cache-prefix: ${{ runner.os }}-v${{ matrix.node-version }}
+
+      - name: create-app
+        run: npx @backstage/create-app
+        env:
+          BACKSTAGE_APP_NAME: example-app
+          YARN_ENABLE_IMMUTABLE_INSTALLS: false
+
+      - name: yarn build
+        run: yarn build:backend
+        working-directory: ./example-app
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: eu-west-1
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: ecr-login
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build Docker image
-        run: |
-          docker build -t backops:latest .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
 
-      - name: Tag Docker image
-        run: |
-          REPOSITORY_URI=$(aws ecr describe-repositories --repository-names backops --query 'repositories[0].repositoryUri' --output text)
-          docker tag backops:latest $REPOSITORY_URI:latest
-
-      - name: Push Docker image to ECR
-        run: |
-          REPOSITORY_URI=$(aws ecr describe-repositories --repository-names backops --query 'repositories[0].repositoryUri' --output text)
-          docker push $REPOSITORY_URI:latest
+      - name: Build and push
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: './example-app'
+          file: ./example-app/packages/backend/Dockerfile
+          push: ${{ (github.event_name == 'repository_dispatch') && (github.event.action == 'release-published') }}
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backstage:latest
+            ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/backstage:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.description=Docker image generated from the latest Backstage release; this contains what you would get out of the box by running npx @backstage/create-app and building a Docker image from the generated source. This is meant to ease the process of evaluating Backstage for the first time, but also has the severe limitation that there is no way to install additional plugins relevant to your infrastructure.
